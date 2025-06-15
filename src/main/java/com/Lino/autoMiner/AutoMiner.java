@@ -9,14 +9,17 @@ import org.bukkit.block.BlockFace;
 import org.bukkit.block.data.Directional;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.ArmorStand;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.world.ChunkUnloadEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -24,31 +27,37 @@ import org.bukkit.scheduler.BukkitRunnable;
 
 import java.io.File;
 import java.sql.*;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
-public class AutoMiner extends JavaPlugin implements Listener {
+public class AutoMiner extends JavaPlugin implements Listener, TabCompleter {
 
-    private final Map<Location, MinerData> activeMachines = new HashMap<>();
-    private final Map<UUID, Integer> playerMinerCount = new HashMap<>();
+    private final Map<Location, MinerData> activeMachines = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> playerMinerCount = new ConcurrentHashMap<>();
+    private final Set<Location> pendingUpdates = Collections.synchronizedSet(new HashSet<>());
     private BukkitRunnable machineTask;
+    private BukkitRunnable saveTask;
     private Connection database;
+    private PreparedStatement insertStmt;
+    private PreparedStatement updateStmt;
+    private PreparedStatement deleteStmt;
     private int maxMinersPerPlayer;
     private int miningSpeed;
 
     private static class MinerData {
-        ArmorStand titleHolo;
-        ArmorStand statsHolo;
+        final ArmorStand titleHolo;
+        final ArmorStand statsHolo;
         int blocksDestroyed;
-        UUID owner;
+        final UUID owner;
+        boolean needsUpdate;
 
         MinerData(ArmorStand title, ArmorStand stats, UUID owner) {
             this.titleHolo = title;
             this.statsHolo = stats;
             this.blocksDestroyed = 0;
             this.owner = owner;
+            this.needsUpdate = false;
         }
     }
 
@@ -58,20 +67,26 @@ public class AutoMiner extends JavaPlugin implements Listener {
         loadConfig();
         initDatabase();
         getServer().getPluginManager().registerEvents(this, this);
+        getCommand("autominer").setTabCompleter(this);
         loadMiners();
-        startMachineTask();
+        startTasks();
+        getLogger().info("AutoMiner enabled successfully!");
     }
 
     @Override
     public void onDisable() {
         if (machineTask != null) machineTask.cancel();
+        if (saveTask != null) saveTask.cancel();
         saveAllMiners();
         activeMachines.values().forEach(data -> {
-            data.titleHolo.remove();
-            data.statsHolo.remove();
+            if (data.titleHolo.isValid()) data.titleHolo.remove();
+            if (data.statsHolo.isValid()) data.statsHolo.remove();
         });
         activeMachines.clear();
         try {
+            if (insertStmt != null) insertStmt.close();
+            if (updateStmt != null) updateStmt.close();
+            if (deleteStmt != null) deleteStmt.close();
             if (database != null && !database.isClosed()) database.close();
         } catch (SQLException e) {
             getLogger().severe("Failed to close database: " + e.getMessage());
@@ -81,48 +96,142 @@ public class AutoMiner extends JavaPlugin implements Listener {
     private void loadConfig() {
         FileConfiguration config = getConfig();
         maxMinersPerPlayer = config.getInt("max-miners-per-player", 5);
-        miningSpeed = config.getInt("mining-speed-ticks", 20);
+        miningSpeed = Math.max(1, config.getInt("mining-speed-ticks", 20));
     }
 
     private void initDatabase() {
         try {
+            if (!getDataFolder().exists()) {
+                getDataFolder().mkdirs();
+            }
+
             File dbFile = new File(getDataFolder(), "miners.db");
             database = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
+            database.setAutoCommit(false);
 
-            Statement stmt = database.createStatement();
-            stmt.execute("CREATE TABLE IF NOT EXISTS miners (" +
-                    "world TEXT NOT NULL," +
-                    "x INTEGER NOT NULL," +
-                    "y INTEGER NOT NULL," +
-                    "z INTEGER NOT NULL," +
-                    "owner TEXT NOT NULL," +
-                    "blocks INTEGER DEFAULT 0," +
-                    "PRIMARY KEY (world, x, y, z)" +
-                    ")");
-            stmt.close();
+            try (Statement stmt = database.createStatement()) {
+                stmt.execute("CREATE TABLE IF NOT EXISTS miners (" +
+                        "world TEXT NOT NULL," +
+                        "x INTEGER NOT NULL," +
+                        "y INTEGER NOT NULL," +
+                        "z INTEGER NOT NULL," +
+                        "owner TEXT NOT NULL," +
+                        "blocks INTEGER DEFAULT 0," +
+                        "PRIMARY KEY (world, x, y, z)" +
+                        ")");
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_owner ON miners(owner)");
+            }
+            database.commit();
+
+            insertStmt = database.prepareStatement(
+                    "INSERT OR REPLACE INTO miners (world, x, y, z, owner, blocks) VALUES (?, ?, ?, ?, ?, ?)"
+            );
+            updateStmt = database.prepareStatement(
+                    "UPDATE miners SET blocks = ? WHERE world = ? AND x = ? AND y = ? AND z = ?"
+            );
+            deleteStmt = database.prepareStatement(
+                    "DELETE FROM miners WHERE world = ? AND x = ? AND y = ? AND z = ?"
+            );
         } catch (SQLException e) {
             getLogger().severe("Failed to initialize database: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-        if (!(sender instanceof Player)) return false;
-        Player player = (Player) sender;
+        if (args.length == 0) {
+            sender.sendMessage("§cUsage: /autominer <give|reload>");
+            return true;
+        }
 
-        ItemStack rod = new ItemStack(Material.END_ROD);
-        ItemMeta meta = rod.getItemMeta();
-        meta.setDisplayName("§6AutoMiner");
-        meta.setLore(java.util.Arrays.asList("§7Place to start mining"));
-        rod.setItemMeta(meta);
+        switch (args[0].toLowerCase()) {
+            case "give":
+                if (!sender.hasPermission("autominer.give")) {
+                    sender.sendMessage("§cYou don't have permission to use this command!");
+                    return true;
+                }
 
-        player.getInventory().addItem(rod);
-        player.sendMessage("§aYou received an AutoMiner!");
+                if (args.length < 3) {
+                    sender.sendMessage("§cUsage: /autominer give <player> <amount>");
+                    return true;
+                }
+
+                Player target = Bukkit.getPlayer(args[1]);
+                if (target == null) {
+                    sender.sendMessage("§cPlayer not found!");
+                    return true;
+                }
+
+                int amount;
+                try {
+                    amount = Integer.parseInt(args[2]);
+                    if (amount < 1 || amount > 64) {
+                        sender.sendMessage("§cAmount must be between 1 and 64!");
+                        return true;
+                    }
+                } catch (NumberFormatException e) {
+                    sender.sendMessage("§cInvalid amount!");
+                    return true;
+                }
+
+                ItemStack rod = new ItemStack(Material.END_ROD, amount);
+                ItemMeta meta = rod.getItemMeta();
+                meta.setDisplayName("§6AutoMiner");
+                meta.setLore(Arrays.asList("§7Place to start mining"));
+                rod.setItemMeta(meta);
+
+                target.getInventory().addItem(rod);
+                sender.sendMessage("§aGave " + amount + " AutoMiner(s) to " + target.getName() + "!");
+                if (!sender.equals(target)) {
+                    target.sendMessage("§aYou received " + amount + " AutoMiner(s)!");
+                }
+                break;
+
+            case "reload":
+                if (!sender.hasPermission("autominer.reload")) {
+                    sender.sendMessage("§cYou don't have permission to use this command!");
+                    return true;
+                }
+
+                reloadConfig();
+                loadConfig();
+                sender.sendMessage("§aAutoMiner configuration reloaded!");
+                break;
+
+            default:
+                sender.sendMessage("§cUnknown subcommand. Use: /autominer <give|reload>");
+        }
+
         return true;
     }
 
-    @EventHandler
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+        if (args.length == 1) {
+            return Arrays.asList("give", "reload").stream()
+                    .filter(s -> s.startsWith(args[0].toLowerCase()))
+                    .collect(Collectors.toList());
+        }
+
+        if (args.length == 2 && args[0].equalsIgnoreCase("give")) {
+            return Bukkit.getOnlinePlayers().stream()
+                    .map(Player::getName)
+                    .filter(s -> s.toLowerCase().startsWith(args[1].toLowerCase()))
+                    .collect(Collectors.toList());
+        }
+
+        if (args.length == 3 && args[0].equalsIgnoreCase("give")) {
+            return Arrays.asList("1", "8", "16", "32", "64");
+        }
+
+        return Collections.emptyList();
+    }
+
+    @EventHandler(priority = EventPriority.HIGH)
     public void onBlockPlace(BlockPlaceEvent event) {
+        if (event.isCancelled()) return;
+
         ItemStack item = event.getItemInHand();
         if (item.getType() != Material.END_ROD || !item.hasItemMeta()) return;
 
@@ -133,7 +242,7 @@ public class AutoMiner extends JavaPlugin implements Listener {
         UUID playerId = player.getUniqueId();
         int currentCount = playerMinerCount.getOrDefault(playerId, 0);
 
-        if (currentCount >= maxMinersPerPlayer) {
+        if (currentCount >= maxMinersPerPlayer && !player.hasPermission("autominer.bypass")) {
             event.setCancelled(true);
             player.sendMessage("§cYou have reached the maximum number of miners (" + maxMinersPerPlayer + ")!");
             return;
@@ -146,13 +255,15 @@ public class AutoMiner extends JavaPlugin implements Listener {
 
         MinerData data = new MinerData(titleHolo, statsHolo, playerId);
         activeMachines.put(loc, data);
-        playerMinerCount.put(playerId, currentCount + 1);
+        playerMinerCount.merge(playerId, 1, Integer::sum);
 
         saveMiner(loc, data);
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.HIGH)
     public void onBlockBreak(BlockBreakEvent event) {
+        if (event.isCancelled()) return;
+
         Location loc = event.getBlock().getLocation();
         MinerData data = activeMachines.get(loc);
 
@@ -169,10 +280,20 @@ public class AutoMiner extends JavaPlugin implements Listener {
         data.statsHolo.remove();
         activeMachines.remove(loc);
 
-        int currentCount = playerMinerCount.getOrDefault(data.owner, 1);
-        playerMinerCount.put(data.owner, Math.max(0, currentCount - 1));
+        playerMinerCount.computeIfPresent(data.owner, (k, v) -> v > 1 ? v - 1 : null);
 
         deleteMiner(loc);
+    }
+
+    @EventHandler
+    public void onChunkUnload(ChunkUnloadEvent event) {
+        activeMachines.entrySet().stream()
+                .filter(e -> e.getKey().getChunk().equals(event.getChunk()))
+                .forEach(e -> {
+                    if (e.getValue().needsUpdate) {
+                        pendingUpdates.add(e.getKey());
+                    }
+                });
     }
 
     private ArmorStand createHologram(Location loc, String text) {
@@ -187,40 +308,32 @@ public class AutoMiner extends JavaPlugin implements Listener {
         return stand;
     }
 
-    private void startMachineTask() {
+    private void startTasks() {
         machineTask = new BukkitRunnable() {
             int tick = 0;
 
             @Override
             public void run() {
-                if (tick % miningSpeed != 0) {
-                    tick++;
-                    return;
-                }
-                tick++;
+                if (tick++ % miningSpeed != 0) return;
 
                 Iterator<Map.Entry<Location, MinerData>> it = activeMachines.entrySet().iterator();
-
                 while (it.hasNext()) {
                     Map.Entry<Location, MinerData> entry = it.next();
                     Location loc = entry.getKey();
                     MinerData data = entry.getValue();
 
-                    if (!loc.getChunk().isLoaded() || !data.titleHolo.isValid()) {
+                    if (!loc.getChunk().isLoaded()) continue;
+
+                    if (!data.titleHolo.isValid() || loc.getBlock().getType() != Material.END_ROD) {
                         data.titleHolo.remove();
                         data.statsHolo.remove();
                         it.remove();
+                        playerMinerCount.computeIfPresent(data.owner, (k, v) -> v > 1 ? v - 1 : null);
+                        deleteMiner(loc);
                         continue;
                     }
 
                     Block machine = loc.getBlock();
-                    if (machine.getType() != Material.END_ROD) {
-                        data.titleHolo.remove();
-                        data.statsHolo.remove();
-                        it.remove();
-                        continue;
-                    }
-
                     BlockFace facing = ((Directional) machine.getBlockData()).getFacing();
                     Block target = machine.getRelative(facing);
 
@@ -231,64 +344,86 @@ public class AutoMiner extends JavaPlugin implements Listener {
 
                         data.blocksDestroyed++;
                         data.statsHolo.setCustomName("§eBlocks: §f" + data.blocksDestroyed);
-
-                        if (data.blocksDestroyed % 10 == 0) updateMinerBlocks(loc, data.blocksDestroyed);
+                        data.needsUpdate = true;
                     }
                 }
             }
         };
-
         machineTask.runTaskTimer(this, 0L, 1L);
+
+        saveTask = new BukkitRunnable() {
+            @Override
+            public void run() {
+                saveUpdatedMiners();
+            }
+        };
+        saveTask.runTaskTimerAsynchronously(this, 200L, 200L);
     }
 
     private void saveMiner(Location loc, MinerData data) {
+        if (insertStmt == null || database == null) return;
+
         try {
-            PreparedStatement stmt = database.prepareStatement(
-                    "INSERT OR REPLACE INTO miners (world, x, y, z, owner, blocks) VALUES (?, ?, ?, ?, ?, ?)"
-            );
-            stmt.setString(1, loc.getWorld().getName());
-            stmt.setInt(2, loc.getBlockX());
-            stmt.setInt(3, loc.getBlockY());
-            stmt.setInt(4, loc.getBlockZ());
-            stmt.setString(5, data.owner.toString());
-            stmt.setInt(6, data.blocksDestroyed);
-            stmt.executeUpdate();
-            stmt.close();
+            insertStmt.setString(1, loc.getWorld().getName());
+            insertStmt.setInt(2, loc.getBlockX());
+            insertStmt.setInt(3, loc.getBlockY());
+            insertStmt.setInt(4, loc.getBlockZ());
+            insertStmt.setString(5, data.owner.toString());
+            insertStmt.setInt(6, data.blocksDestroyed);
+            insertStmt.executeUpdate();
+            database.commit();
         } catch (SQLException e) {
             getLogger().severe("Failed to save miner: " + e.getMessage());
         }
     }
 
-    private void updateMinerBlocks(Location loc, int blocks) {
-        try {
-            PreparedStatement stmt = database.prepareStatement(
-                    "UPDATE miners SET blocks = ? WHERE world = ? AND x = ? AND y = ? AND z = ?"
-            );
-            stmt.setInt(1, blocks);
-            stmt.setString(2, loc.getWorld().getName());
-            stmt.setInt(3, loc.getBlockX());
-            stmt.setInt(4, loc.getBlockY());
-            stmt.setInt(5, loc.getBlockZ());
-            stmt.executeUpdate();
-            stmt.close();
-        } catch (SQLException e) {
-            getLogger().severe("Failed to update miner blocks: " + e.getMessage());
-        }
+    private void deleteMiner(Location loc) {
+        if (deleteStmt == null || database == null) return;
+
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                deleteStmt.setString(1, loc.getWorld().getName());
+                deleteStmt.setInt(2, loc.getBlockX());
+                deleteStmt.setInt(3, loc.getBlockY());
+                deleteStmt.setInt(4, loc.getBlockZ());
+                deleteStmt.executeUpdate();
+                database.commit();
+            } catch (SQLException e) {
+                getLogger().severe("Failed to delete miner: " + e.getMessage());
+            }
+        });
     }
 
-    private void deleteMiner(Location loc) {
+    private void saveUpdatedMiners() {
+        if (activeMachines.isEmpty()) return;
+
         try {
-            PreparedStatement stmt = database.prepareStatement(
-                    "DELETE FROM miners WHERE world = ? AND x = ? AND y = ? AND z = ?"
-            );
-            stmt.setString(1, loc.getWorld().getName());
-            stmt.setInt(2, loc.getBlockX());
-            stmt.setInt(3, loc.getBlockY());
-            stmt.setInt(4, loc.getBlockZ());
-            stmt.executeUpdate();
-            stmt.close();
+            for (Location loc : new ArrayList<>(pendingUpdates)) {
+                MinerData data = activeMachines.get(loc);
+                if (data != null && data.needsUpdate) {
+                    updateStmt.setInt(1, data.blocksDestroyed);
+                    updateStmt.setString(2, loc.getWorld().getName());
+                    updateStmt.setInt(3, loc.getBlockX());
+                    updateStmt.setInt(4, loc.getBlockY());
+                    updateStmt.setInt(5, loc.getBlockZ());
+                    updateStmt.addBatch();
+                    data.needsUpdate = false;
+                }
+            }
+            pendingUpdates.clear();
+
+            for (MinerData data : activeMachines.values()) {
+                if (data.needsUpdate) {
+                    data.needsUpdate = false;
+                }
+            }
+
+            if (updateStmt != null) {
+                updateStmt.executeBatch();
+                database.commit();
+            }
         } catch (SQLException e) {
-            getLogger().severe("Failed to delete miner: " + e.getMessage());
+            getLogger().severe("Failed to save updated miners: " + e.getMessage());
         }
     }
 
@@ -297,39 +432,60 @@ public class AutoMiner extends JavaPlugin implements Listener {
     }
 
     private void loadMiners() {
-        try {
-            Statement stmt = database.createStatement();
-            ResultSet rs = stmt.executeQuery("SELECT * FROM miners");
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                int loaded = 0;
+                try (Statement stmt = database.createStatement();
+                     ResultSet rs = stmt.executeQuery("SELECT * FROM miners")) {
 
-            while (rs.next()) {
-                Location loc = new Location(
-                        Bukkit.getWorld(rs.getString("world")),
-                        rs.getInt("x"),
-                        rs.getInt("y"),
-                        rs.getInt("z")
-                );
+                    while (rs.next()) {
+                        String worldName = rs.getString("world");
+                        if (Bukkit.getWorld(worldName) == null) continue;
 
-                if (loc.getWorld() == null || loc.getBlock().getType() != Material.END_ROD) continue;
+                        Location loc = new Location(
+                                Bukkit.getWorld(worldName),
+                                rs.getInt("x"),
+                                rs.getInt("y"),
+                                rs.getInt("z")
+                        );
 
-                UUID owner = UUID.fromString(rs.getString("owner"));
+                        UUID owner = UUID.fromString(rs.getString("owner"));
+                        int blocks = rs.getInt("blocks");
+                        loaded++;
 
-                ArmorStand titleHolo = createHologram(loc.clone().add(0.5, 1.3, 0.5), "§6§lAutoMiner");
-                ArmorStand statsHolo = createHologram(loc.clone().add(0.5, 1, 0.5), "§eBlocks: §f0");
+                        new BukkitRunnable() {
+                            @Override
+                            public void run() {
+                                if (!loc.getChunk().isLoaded()) {
+                                    loc.getChunk().load();
+                                }
 
-                MinerData data = new MinerData(titleHolo, statsHolo, owner);
-                data.blocksDestroyed = rs.getInt("blocks");
-                data.statsHolo.setCustomName("§eBlocks: §f" + data.blocksDestroyed);
+                                if (loc.getBlock().getType() != Material.END_ROD) {
+                                    deleteMiner(loc);
+                                    return;
+                                }
 
-                activeMachines.put(loc, data);
+                                ArmorStand titleHolo = createHologram(loc.clone().add(0.5, 1.3, 0.5), "§6§lAutoMiner");
+                                ArmorStand statsHolo = createHologram(loc.clone().add(0.5, 1, 0.5), "§eBlocks: §f" + blocks);
 
-                int currentCount = playerMinerCount.getOrDefault(owner, 0);
-                playerMinerCount.put(owner, currentCount + 1);
+                                MinerData data = new MinerData(titleHolo, statsHolo, owner);
+                                data.blocksDestroyed = blocks;
+
+                                activeMachines.put(loc, data);
+                                playerMinerCount.merge(owner, 1, Integer::sum);
+                            }
+                        }.runTask(AutoMiner.this);
+                    }
+
+                    if (loaded > 0) {
+                        getLogger().info("Loaded " + loaded + " AutoMiners from database!");
+                    }
+                } catch (SQLException e) {
+                    getLogger().severe("Failed to load miners: " + e.getMessage());
+                    e.printStackTrace();
+                }
             }
-
-            rs.close();
-            stmt.close();
-        } catch (SQLException e) {
-            getLogger().severe("Failed to load miners: " + e.getMessage());
-        }
+        }.runTaskLater(this, 20L);
     }
 }

@@ -6,14 +6,23 @@ author: Lino
 
 commands:
   autominer:
-    description: Get an AutoMiner end rod
-    usage: /<command>
+    description: AutoMiner management commands
+    usage: /<command> <give|reload>
     permission: autominer.use
 
 permissions:
   autominer.use:
     description: Allows using the autominer command
     default: true
+  autominer.give:
+    description: Allows giving autominers to players
+    default: op
+  autominer.reload:
+    description: Allows reloading the configuration
+    default: op
   autominer.admin:
     description: Allows breaking any autominer
+    default: op
+  autominer.bypass:
+    description: Bypass the miner limit
     default: op

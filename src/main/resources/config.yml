@@ -1,8 +1,10 @@
 # AutoMiner Configuration File
 
 # Maximum number of miners each player can place
+# Players with autominer.bypass permission ignore this limit
 max-miners-per-player: 5
 
 # Mining speed in ticks (20 ticks = 1 second)
 # Lower values = faster mining
+# Minimum value: 1
 mining-speed-ticks: 20
