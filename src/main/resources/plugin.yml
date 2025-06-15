@@ -1,0 +1,19 @@
+name: AutoMiner
+version: '1.0'
+main: com.Lino.autoMiner.AutoMiner
+api-version: '1.21'
+author: Lino
+
+commands:
+  autominer:
+    description: Get an AutoMiner end rod
+    usage: /<command>
+    permission: autominer.use
+
+permissions:
+  autominer.use:
+    description: Allows using the autominer command
+    default: true
+  autominer.admin:
+    description: Allows breaking any autominer
+    default: op
